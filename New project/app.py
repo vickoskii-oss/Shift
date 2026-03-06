@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +32,7 @@ def detect_default_workbook_path() -> Path:
 
 DEFAULT_WORKBOOK_PATH = detect_default_workbook_path()
 MAX_SHIFT_ROWS = 500
+AUTOSAVE_DB_PATH = SCRIPT_DIR / "shift_manager_autosave.db"
 
 SHIFT_COLUMNS = [
     "Date",
@@ -275,23 +278,106 @@ def tax_estimate(shifts: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def load_source_bytes(uploaded_file: Any, workbook_path: str) -> tuple[bytes | None, str]:
+def _init_autosave_db() -> None:
+    AUTOSAVE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(AUTOSAVE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS autosaved_shifts (
+                scope_key TEXT PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _serialize_shifts(shifts: pd.DataFrame) -> str:
+    payload = shifts.reindex(columns=SHIFT_COLUMNS, fill_value=pd.NA).copy()
+    payload["Date"] = pd.to_datetime(payload["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    payload = payload.where(pd.notna(payload), None)
+    records = payload.to_dict(orient="records")
+    return json.dumps(records, ensure_ascii=True, separators=(",", ":"))
+
+
+def _deserialize_shifts(data_json: str) -> pd.DataFrame:
+    records = json.loads(data_json)
+    if not isinstance(records, list):
+        return pd.DataFrame(columns=SHIFT_COLUMNS)
+    return pd.DataFrame(records)
+
+
+def load_autosaved_shifts(scope_key: str) -> tuple[pd.DataFrame | None, str | None]:
+    _init_autosave_db()
+    with sqlite3.connect(AUTOSAVE_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT data_json, updated_at FROM autosaved_shifts WHERE scope_key = ?",
+            (scope_key,),
+        ).fetchone()
+
+    if row is None:
+        return None, None
+
+    data_json, updated_at = row
+    try:
+        autosaved = _deserialize_shifts(data_json)
+        return normalize_shifts(autosaved), updated_at
+    except Exception:
+        return None, None
+
+
+def save_autosaved_shifts(scope_key: str, shifts: pd.DataFrame) -> str:
+    _init_autosave_db()
+    normalized = normalize_shifts(shifts)
+    payload_json = _serialize_shifts(normalized)
+    updated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    with sqlite3.connect(AUTOSAVE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO autosaved_shifts(scope_key, data_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(scope_key) DO UPDATE SET
+                data_json = excluded.data_json,
+                updated_at = excluded.updated_at
+            """,
+            (scope_key, payload_json, updated_at),
+        )
+        conn.commit()
+
+    return updated_at
+
+
+def clear_autosaved_shifts(scope_key: str) -> None:
+    _init_autosave_db()
+    with sqlite3.connect(AUTOSAVE_DB_PATH) as conn:
+        conn.execute("DELETE FROM autosaved_shifts WHERE scope_key = ?", (scope_key,))
+        conn.commit()
+
+
+def load_source_bytes(uploaded_file: Any, workbook_path: str) -> tuple[bytes | None, str, str]:
     if uploaded_file is not None:
-        return uploaded_file.getvalue(), f"upload::{uploaded_file.name}::{uploaded_file.size}"
+        scope_key = f"upload::{uploaded_file.name}"
+        source_key = f"upload::{uploaded_file.name}::{uploaded_file.size}"
+        return uploaded_file.getvalue(), source_key, scope_key
 
     raw_path = (workbook_path or "").strip()
     if not raw_path:
         search_paths = [DEFAULT_WORKBOOK_PATH]
+        fallback_scope = f"path::{DEFAULT_WORKBOOK_PATH.resolve()}"
     else:
         path = Path(raw_path).expanduser()
         if path.is_absolute():
             search_paths = [path]
+            fallback_scope = f"path::{path.resolve()}"
         else:
             search_paths = [
                 Path.cwd() / path,
                 SCRIPT_DIR / path,
                 REPO_ROOT_DIR / path,
             ]
+            fallback_scope = f"path::{raw_path}"
 
     seen: set[Path] = set()
     for candidate in search_paths:
@@ -300,9 +386,11 @@ def load_source_bytes(uploaded_file: Any, workbook_path: str) -> tuple[bytes | N
             continue
         seen.add(resolved)
         if resolved.exists():
-            return resolved.read_bytes(), f"path::{resolved}::{resolved.stat().st_mtime}"
+            source_key = f"path::{resolved}::{resolved.stat().st_mtime}"
+            scope_key = f"path::{resolved}"
+            return resolved.read_bytes(), source_key, scope_key
 
-    return None, "none"
+    return None, "none", fallback_scope
 
 
 def currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -326,7 +414,7 @@ def main() -> None:
         workbook_path = st.text_input("Excel file path", str(DEFAULT_WORKBOOK_PATH))
         uploaded_file = st.file_uploader("Or upload workbook", type=["xlsx"])
 
-    source_bytes, source_key = load_source_bytes(uploaded_file, workbook_path)
+    source_bytes, source_key, autosave_scope_key = load_source_bytes(uploaded_file, workbook_path)
 
     if source_bytes is None:
         st.error("Workbook not found. Upload a .xlsx file or update the file path in the sidebar.")
@@ -336,7 +424,32 @@ def main() -> None:
         st.session_state["source_key"] = source_key
         st.session_state["template_bytes"] = source_bytes
         loaded = shifts_from_workbook(source_bytes)
-        st.session_state["shifts"] = normalize_shifts(loaded)
+        try:
+            autosaved, autosaved_updated_at = load_autosaved_shifts(autosave_scope_key)
+        except Exception:
+            autosaved, autosaved_updated_at = None, None
+        if autosaved is not None:
+            st.session_state["shifts"] = autosaved
+        else:
+            st.session_state["shifts"] = normalize_shifts(loaded)
+        st.session_state["autosave_scope_key"] = autosave_scope_key
+        st.session_state["autosave_updated_at"] = autosaved_updated_at
+        st.session_state["autosave_signature"] = _serialize_shifts(st.session_state["shifts"])
+
+    with st.sidebar:
+        st.subheader("Autosave")
+        st.caption("Edits are saved automatically on this app server.")
+        autosave_updated_at = st.session_state.get("autosave_updated_at")
+        if autosave_updated_at:
+            st.write(f"Last saved: `{autosave_updated_at}`")
+        else:
+            st.write("No autosave saved yet.")
+        if st.button("Clear autosaved data"):
+            clear_autosaved_shifts(autosave_scope_key)
+            st.session_state.pop("autosave_signature", None)
+            st.session_state["autosave_updated_at"] = None
+            st.session_state["source_key"] = None
+            st.rerun()
 
     shifts_df = st.session_state.get("shifts", pd.DataFrame(columns=SHIFT_COLUMNS))
 
@@ -379,6 +492,14 @@ def main() -> None:
 
     normalized = normalize_shifts(edited)
     st.session_state["shifts"] = normalized
+    current_signature = _serialize_shifts(normalized)
+    if st.session_state.get("autosave_signature") != current_signature:
+        try:
+            saved_at = save_autosaved_shifts(autosave_scope_key, normalized)
+            st.session_state["autosave_signature"] = current_signature
+            st.session_state["autosave_updated_at"] = saved_at
+        except Exception as exc:
+            st.warning(f"Autosave failed: {exc}")
 
     total_gross = float(normalized["Gross Pay (GBP)"].sum()) if not normalized.empty else 0.0
     total_expenses = float(normalized["Total Expenses (GBP)"].sum()) if not normalized.empty else 0.0
@@ -453,4 +574,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
