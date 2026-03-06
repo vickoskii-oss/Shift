@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import date, datetime
 from io import BytesIO
@@ -9,7 +9,26 @@ import pandas as pd
 from openpyxl import load_workbook
 
 
-DEFAULT_WORKBOOK_PATH = Path(r"C:/Users/olugb/Downloads/Self_Employed_Shift_Manager.xlsx")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT_DIR = SCRIPT_DIR.parent
+WORKBOOK_FILENAME = "Self_Employed_Shift_Manager.xlsx"
+LOCAL_DOWNLOADS_WORKBOOK = Path(r"C:/Users/olugb/Downloads/Self_Employed_Shift_Manager.xlsx")
+
+
+def detect_default_workbook_path() -> Path:
+    candidates = [
+        SCRIPT_DIR / WORKBOOK_FILENAME,
+        REPO_ROOT_DIR / WORKBOOK_FILENAME,
+        Path.cwd() / WORKBOOK_FILENAME,
+        LOCAL_DOWNLOADS_WORKBOOK,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return SCRIPT_DIR / WORKBOOK_FILENAME
+
+
+DEFAULT_WORKBOOK_PATH = detect_default_workbook_path()
 MAX_SHIFT_ROWS = 500
 
 SHIFT_COLUMNS = [
@@ -260,9 +279,28 @@ def load_source_bytes(uploaded_file: Any, workbook_path: str) -> tuple[bytes | N
     if uploaded_file is not None:
         return uploaded_file.getvalue(), f"upload::{uploaded_file.name}::{uploaded_file.size}"
 
-    path = Path(workbook_path).expanduser()
-    if path.exists():
-        return path.read_bytes(), f"path::{path.resolve()}::{path.stat().st_mtime}"
+    raw_path = (workbook_path or "").strip()
+    if not raw_path:
+        search_paths = [DEFAULT_WORKBOOK_PATH]
+    else:
+        path = Path(raw_path).expanduser()
+        if path.is_absolute():
+            search_paths = [path]
+        else:
+            search_paths = [
+                Path.cwd() / path,
+                SCRIPT_DIR / path,
+                REPO_ROOT_DIR / path,
+            ]
+
+    seen: set[Path] = set()
+    for candidate in search_paths:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved.read_bytes(), f"path::{resolved}::{resolved.stat().st_mtime}"
 
     return None, "none"
 
